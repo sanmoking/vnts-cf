@@ -30,6 +30,8 @@ RATE_LIMIT_PER_MINUTE = "30"
 # 日志等级  
 DEBUG_MODE = "1"
 LOG_LEVEL = "debug"
+
+VERSION = "2026-01-06"
   
 [[durable_objects.bindings]]
 # Durable Objects 绑定配置
