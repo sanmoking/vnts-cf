@@ -1,5 +1,6 @@
 let globalLogger = null;
 let isInitialized = false;
+let pendingStorage = null;
 
 export class Logger {
   constructor(env) {
@@ -20,7 +21,58 @@ export class Logger {
     const configLevel = (env.LOG_LEVEL || "warn").toLowerCase();
     this.currentLevel = this.levels[configLevel] ?? this.levels.warn;
 
+    // 检查是否启用存储日志
+    this.logPassword = env.LOG_PASSWORD || null;
+    this.enableStorage = this.logPassword !== null && this.logPassword !== "";
+
+    // 检查是否为本地部署
+    this.isLocalDeploy = env.LOCAL_DEPLOY === "true";
+
+    // 存储相关属性
+    this.storageBuffer = [];
+    this.maxStorageLogs = 1000; // 保留最近1000条日志
+    this.storage = null; // 将在 RelayRoom 中设置
+
     // console.log(`[Logger] 当前日志等级: ${configLevel} (级别: ${this.currentLevel})`);
+  }
+
+  // 设置 storage 引用
+  setStorage(storage) {
+    this.storage = storage;
+  }
+
+  // 写入存储
+  async writeToStorage(level, message) {
+    // 本地部署时不写入存储
+    if (this.isLocalDeploy) {
+      return;
+    }
+    if (!this.enableStorage || !this.storage) return;
+
+    try {
+      // 移除时间和等级前缀 [YYYY-MM-DD HH:MM:SS] [级别] :
+      const cleanMessage = message.replace(
+        /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[.*?\] : /,
+        ""
+      );
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        level: level,
+        message: cleanMessage,
+      };
+
+      this.storageBuffer.push(logEntry);
+
+      // 限制日志数量
+      if (this.storageBuffer.length > this.maxStorageLogs) {
+        this.storageBuffer = this.storageBuffer.slice(-this.maxStorageLogs);
+      }
+
+      // 写入 storage
+      await this.storage.put("operationLogs", this.storageBuffer);
+    } catch (error) {
+      console.error(`[Logger-存储] 写入失败: ${error.message}`);
+    }
   }
 
   shouldLog(level) {
@@ -63,98 +115,103 @@ export class Logger {
 
   error(...args) {
     if (this.shouldLog("error")) {
-      console.error(this.createLogMessage("error", ...args));
+      const message = this.createLogMessage("error", ...args);
+      console.error(message);
+      this.writeToStorage("error", message);
     }
   }
 
   warn(...args) {
     if (this.shouldLog("warn")) {
-      console.warn(this.createLogMessage("warn", ...args));
+      const message = this.createLogMessage("warn", ...args);
+      console.warn(message);
+      this.writeToStorage("warn", message);
     }
   }
 
   info(...args) {
     if (this.shouldLog("info")) {
-      console.log(this.createLogMessage("info", ...args));
+      const message = this.createLogMessage("info", ...args);
+      console.log(message);
+      this.writeToStorage("info", message);
     }
   }
 
   debug(...args) {
     if (this.shouldLog("debug")) {
-      console.log(this.createLogMessage("debug", ...args));
+      const message = this.createLogMessage("debug", ...args);
+      console.log(message);
+      this.writeToStorage("debug", message);
     }
   }
 }
 
-// 日志初始化函数 - 支持 Cloudflare Worker 环境变量设置
+// 设置待处理的 storage 引用
+export function setPendingStorage(storage) {
+  pendingStorage = storage;
+  // 如果 logger 已经初始化但没有 storage，立即设置
+  if (globalLogger && !globalLogger.storage) {
+    globalLogger.setStorage(storage);
+  }
+}
+
+// 日志初始化函数
 function autoInitialize() {
   if (isInitialized) return;
 
-  // 尝试多种方式获取环境变量
+  // 从 RelayRoom 获取环境变量
   let env = { LOG_LEVEL: "warn" };
   let foundSource = "默认值";
 
-  // 方式1: 从globalThis.env获取（Cloudflare Worker Durable Object）
+  // 检查 RelayRoom 实例是否存在
   if (
     typeof globalThis !== "undefined" &&
-    globalThis.env &&
-    globalThis.env.LOG_LEVEL
+    globalThis.RelayRoomInstance &&
+    globalThis.RelayRoomInstance.env
   ) {
-    env = globalThis.env;
-    foundSource = "globalThis.env";
-    // console.log('[Logger] 从globalThis.env获取环境变量:', JSON.stringify(env));
-  }
-  // 方式2: 从globalThis获取（如果已设置）
-  else if (typeof globalThis !== "undefined" && globalThis.LOG_LEVEL) {
-    env = { LOG_LEVEL: globalThis.LOG_LEVEL };
-    foundSource = "globalThis.LOG_LEVEL";
-    // console.log('[Logger] 从globalThis.LOG_LEVEL获取LOG_LEVEL:', globalThis.LOG_LEVEL);
-  }
-  // 方式3: 从全局变量获取（兼容性）
-  else if (typeof LOG_LEVEL !== "undefined") {
-    env = { LOG_LEVEL: LOG_LEVEL };
-    foundSource = "全局变量LOG_LEVEL";
-    // console.log('[Logger] 从全局变量获取LOG_LEVEL:', LOG_LEVEL);
-  }
-  // 方式4: 从process.env获取（Node.js环境）
-  else if (
-    typeof process !== "undefined" &&
-    process.env &&
-    process.env.LOG_LEVEL
-  ) {
-    env = { LOG_LEVEL: process.env.LOG_LEVEL };
-    foundSource = "process.env";
-    // console.log('[Logger] 从process.env获取LOG_LEVEL:', process.env.LOG_LEVEL);
-  } else {
-    // console.log('[Logger] 未找到环境变量，使用默认值 warn');
+    env = globalThis.RelayRoomInstance.env;
+    foundSource = "RelayRoom.env";
   }
 
-  // console.log(`[Logger] 使用来源: ${foundSource}`);
   globalLogger = new Logger(env);
+  if (pendingStorage) {
+    globalLogger.setStorage(pendingStorage);
+  }
+  logger.globalLogger = globalLogger;
   isInitialized = true;
 }
 
 // 导出全局logger，自动初始化
 export const logger = {
+  globalLogger: null,
+
   error: (...args) => {
     if (!isInitialized) autoInitialize();
-    globalLogger?.error(...args);
+    if (globalLogger) {
+      globalLogger.error(...args);
+    }
   },
   warn: (...args) => {
     if (!isInitialized) autoInitialize();
-    globalLogger?.warn(...args);
+    if (globalLogger) {
+      globalLogger.warn(...args);
+    }
   },
   info: (...args) => {
     if (!isInitialized) autoInitialize();
-    globalLogger?.info(...args);
+    if (globalLogger) {
+      globalLogger.info(...args);
+    }
   },
   debug: (...args) => {
     if (!isInitialized) autoInitialize();
-    globalLogger?.debug(...args);
+    if (globalLogger) {
+      globalLogger.debug(...args);
+    }
   },
 };
 
-// 可选：手动设置全局日志级别
+// 手动设置全局日志级别
 export function setGlobalLogLevel(level) {
   // console.log(`[Logger] 日志级别设置为: ${level}`);
   if (typeof globalThis !== "undefined") {

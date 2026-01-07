@@ -38,6 +38,13 @@ export default {
       return roomStub.fetch(request);
     }
 
+    // 添加日志端点
+    if (pathname === "/log" || pathname === "/log/clear") {
+      const roomId = searchParams.get("room") || "default";
+      const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
+      return roomStub.fetch(request);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 };

@@ -3,12 +3,15 @@ import { VntContext } from "./core/context.js";
 import { PacketHandler } from "./core/handler.js";
 import { PROTOCOL, TRANSPORT_PROTOCOL } from "./core/constants.js";
 import { parseVNTHeaderFast } from "./utils/fast_parser.js";
-import { logger } from "./core/logger.js";
+import { logger, setPendingStorage } from "./core/logger.js";
 
 export class RelayRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    if (typeof globalThis !== "undefined") {
+      globalThis.RelayRoomInstance = this;
+    }
     this.connections = new Map();
     this.contexts = new Map();
     this.p2p_connections = new Map();
@@ -39,6 +42,14 @@ export class RelayRoom {
       room: { count: 0, lastReset: Date.now() },
       test: { count: 0, lastReset: Date.now() },
     };
+    // 添加缓存保存控制
+    this.isSavingCache = false; // 防止并发保存
+    this.pendingSave = false; // 是否有待保存的更改
+    this.lastCacheSaveTime = 0; // 上次保存时间
+    this.saveAlarmScheduled = false; // 是否已调度定时保存
+
+    // 登录失败计数器
+    this.loginAttempts = new Map();
   }
 
   // 检查IP限流
@@ -114,32 +125,187 @@ export class RelayRoom {
     }
   }
 
+  // 从存储恢复 AppCache
+  async restoreAppCache() {
+    try {
+      // 检查是否为本地部署
+      const isLocalDeploy = this.env.LOCAL_DEPLOY === "true";
+      if (isLocalDeploy) {
+        logger.info(`[AppCache-恢复] 本地部署模式，跳过从存储恢复`);
+        return;
+      }
+
+      const cacheData = await this.state.storage.get("appCacheData");
+
+      if (!cacheData) {
+        logger.info(`[AppCache-恢复] 存储中无缓存数据，使用新实例`);
+        return;
+      }
+
+      // 检查缓存版本
+      if (cacheData.version !== "1.0") {
+        logger.warn(`[AppCache-恢复] 缓存版本不匹配，使用新实例`);
+        return;
+      }
+
+      // 反序列化 AppCache
+      const { AppCache } = await import("./core/context.js");
+      const restoredCache = AppCache.deserialize(cacheData, this);
+      // logger.debug("restore", "反序列化结果检查", {hasVirtualNetwork: !!restoredCache.virtual_network,virtualNetworkMapSize: restoredCache.virtual_network?.map?.size || 0,virtualNetworkEntries:restoredCache.virtual_network?.map?.entries().length || 0,});
+
+      // 检查原始数据结构
+      if (cacheData.virtual_network) {
+        // logger.debug("restore", "原始数据检查", {hasVirtualNetwork: true,entriesCount: cacheData.virtual_network.entries?.length || 0,firstEntry: cacheData.virtual_network.entries?.[0],});
+      }
+
+      // 替换 PacketHandler 中的缓存
+      this.packetHandler.cache = restoredCache;
+      restoredCache.relayRoom = this;
+      // 恢复 networks 引用（这是在 handler.js 中使用的快捷引用）
+      if (!this.packetHandler.cache.networks) {
+        this.packetHandler.cache.networks = new Map();
+      }
+
+      // 将 virtual_network 中的数据同步到 networks
+      let restoredNetworks = 0; // 定义变量
+      for (const [
+        token,
+        networkInfo,
+      ] of restoredCache.virtual_network.map.entries()) {
+        const item = restoredCache.virtual_network.map.get(token);
+        if (item && Date.now() <= item.expireTime) {
+          this.packetHandler.cache.networks.set(token, item.value);
+          restoredNetworks++; // 计算恢复的网络数
+        }
+      }
+
+      // logger.debug("restore", "成功恢复 AppCache", {totalNetworks: restoredCache.virtual_network.map.size,restoredNetworks: restoredNetworks,});
+
+      logger.info(
+        `[AppCache-恢复] 成功恢复 AppCache，Token数量: ${this.packetHandler.cache.networks.size}`
+      );
+    } catch (error) {
+      logger.error(`[AppCache-恢复] 恢复失败: ${error.message}`, error);
+      // 恢复失败时继续使用新的 AppCache
+    }
+  }
+
+  // 保存 AppCache 到存储
+  async saveAppCache() {
+    // 检查是否为本地部署
+    const isLocalDeploy = this.env.LOCAL_DEPLOY === "true";
+    if (isLocalDeploy) {
+      // 本地部署模式，不保存到存储
+      return;
+    }
+
+    // 检查是否已经完成初始化恢复
+    if (!this.isInitialized) {
+      return;
+    }
+
+    // 防止并发保存
+    if (this.isSavingCache) {
+      this.pendingSave = true;
+      return;
+    }
+
+    try {
+      this.isSavingCache = true;
+      this.pendingSave = false;
+
+      // 序列化 AppCache
+      const cacheData = this.packetHandler.cache.serialize();
+      // logger.debug("save", "AppCache 序列化完成", {networksCount: this.packetHandler.cache.networks?.size || 0,dataSize: JSON.stringify(cacheData).length,});
+
+      // 保存到 Durable Object Storage
+      await this.state.storage.put("appCacheData", cacheData);
+
+      this.lastCacheSaveTime = Date.now();
+      // logger.debug(`[AppCache-保存] 成功保存缓存到存储`);
+    } catch (error) {
+      logger.error(`[AppCache-保存] 保存失败: ${error.message}`, error);
+    } finally {
+      this.isSavingCache = false;
+
+      // 如果有待保存的更改，再次触发保存
+      if (this.pendingSave) {
+        // 使用 Promise 而不是 setTimeout
+        Promise.resolve().then(() => this.saveAppCache());
+      }
+    }
+  }
+
+  // 同步保存（立即保存，不使用定时器）
+  async syncSaveAppCache() {
+    await this.saveAppCache();
+  }
+
+  // 设置定时保存 Alarm
+  async setupSaveAlarm() {
+    // 检查是否为本地部署
+    const isLocalDeploy = this.env.LOCAL_DEPLOY === "true";
+    if (isLocalDeploy) {
+      // logger.debug(`[Alarm-设置] 本地部署模式，跳过设置定时保存`);
+      return;
+    }
+
+    // 设置定时保存，每 5 分钟保存一次
+    const saveIntervalMs =
+      parseInt(this.env.CACHE_SAVE_INTERVAL || "300") * 1000;
+
+    // 调度 Alarm
+    await this.state.storage.setAlarm(Date.now() + saveIntervalMs);
+    this.saveAlarmScheduled = true;
+
+    logger.debug(
+      `[Alarm-设置] 已设置定时保存，间隔: ${saveIntervalMs / 1000} 秒`
+    );
+  }
+
+  // Alarm 处理函数
+  async alarm() {
+    // logger.debug(`[Alarm-触发] 定时保存触发`);
+    try {
+      // 执行保存
+      await this.saveAppCache();
+
+      // 重新调度下一次 Alarm
+      await this.setupSaveAlarm();
+      // logger.debug(`[Alarm-完成] 定时保存完成，已调度下一次保存`);
+    } catch (error) {
+      logger.error(`[Alarm-错误] 定时保存失败: ${error.message}`, error);
+
+      // 即使失败也要重新调度
+      try {
+        await this.setupSaveAlarm();
+      } catch (scheduleError) {
+        logger.error(
+          `[Alarm-错误] 重新调度失败: ${scheduleError.message}`,
+          scheduleError
+        );
+      }
+    }
+  }
+
   async doInit() {
     try {
       // 初始化PacketHandler（包括RSA）
       await this.packetHandler.init();
 
-      // 获取当前部署版本（从环境变量或代码中获取）
-      const currentVersion = this.env.VERSION || Date.now().toString();
+      // 设置启动时间
+      this.startTime = Date.now();
 
-      const storedData = await this.state.storage.get("deployData");
-      if (
-        storedData &&
-        storedData.version === currentVersion &&
-        storedData.startTime > 0
-      ) {
-        // 版本相同，恢复原有启动时间
-        this.startTime = storedData.startTime;
-        // logger.info(`[RelayRoom-初始化] 从存储中恢复启动时间: ${this.getStartTimeBeijing()}`);
-      } else {
-        // 版本不同或首次部署，设置新的启动时间
-        this.startTime = Date.now();
-        await this.state.storage.put("deployData", {
-          version: currentVersion,
-          startTime: this.startTime,
-        });
-        // logger.info(`[RelayRoom-初始化] 检测到新版本，设置新的启动时间: ${this.getStartTimeBeijing()}`);
-      }
+      // 设置 logger 的 storage 引用
+      setPendingStorage(this.state.storage);
+
+      // 从存储恢复 AppCache
+      await this.restoreAppCache();
+      // 清除可能存在的旧 Alarm 防止覆盖原始数据
+      await this.state.storage.deleteAlarm();
+
+      // 设置定时保存 Alarm
+      await this.setupSaveAlarm();
 
       // logger.info(`[RelayRoom-初始化] RelayRoom初始化完成`);
     } catch (error) {
@@ -305,25 +471,6 @@ export class RelayRoom {
     // logger.debug(`更新客户端 ${clientId} 的P2P连接状态，目标数量: ${p2pTargets.length}`);
   }
 
-  // 检查是否有P2P连接
-  hasP2PConnection(sourceId, targetIp) {
-    const sourceP2P = this.p2p_connections.get(sourceId);
-    if (!sourceP2P) {
-      // logger.debug(`客户端 ${sourceId} 无P2P连接记录`);
-      return false;
-    }
-
-    // 查找目标客户端ID
-    for (const [clientId, context] of this.contexts) {
-      if (context.virtual_ip === targetIp) {
-        const hasConnection = sourceP2P.has(clientId);
-        // logger.debug(`检查P2P连接: ${sourceId} -> ${targetIp} (客户端ID: ${clientId}), 结果: ${hasConnection ? "有连接" : "无连接"}`);
-        return hasConnection;
-      }
-    }
-    // logger.debug(`未找到目标IP ${targetIp} 对应的客户端`);
-    return false;
-  }
   // 处理客户端 P2P 状态报告
   handleP2PStatusReport(clientId, p2pList) {
     // logger.debug(`开始处理客户端 ${clientId} 的P2P状态报告，目标数量: ${p2pList.length}`);
@@ -450,9 +597,15 @@ export class RelayRoom {
             upStream = this.formatBytes(statusInfo.up_stream);
             downStream = this.formatBytes(statusInfo.down_stream);
             // NAT 类型转换
-            if (statusInfo.nat_type === "Symmetric") {
+            if (
+              statusInfo.nat_type === "Symmetric" ||
+              statusInfo.nat_type === 0
+            ) {
               natType = "对称型";
-            } else if (statusInfo.nat_type === "Cone") {
+            } else if (
+              statusInfo.nat_type === "Cone" ||
+              statusInfo.nat_type === 1
+            ) {
               natType = "锥型";
             } else {
               natType = "未知";
@@ -870,7 +1023,7 @@ export class RelayRoom {
   
         /* 每行不同背景色 */  
 	tr:nth-child(even) td { background: #c3c9ed; } /* 偶数行 - 浅蓝色 */  
-	tr:nth-child(odd) td { background: #b3e6b3; } /* 奇数行 - 浅绿色 */  
+	tr:nth-child(odd) td { background: #b6aaf1; } /* 奇数行 - 浅紫色 */  
   
 	/* 服务器行特殊颜色 */  
 	tr[data-type="gateway"] td {   
@@ -1570,20 +1723,638 @@ export class RelayRoom {
 </html>`;
   }
 
+  // 处理日志端点
+  async handleLogEndpoint(request) {
+    const clientIp = this.getClientIp(request);
+    const url = new URL(request.url);
+
+    // 检查是否启用了日志密码
+    if (!this.env.LOG_PASSWORD) {
+      return new Response("Not Found", { status: 404 });
+    }
+
+    // 检查登录状态
+    const cookieHeader = request.headers.get("Cookie") || "";
+    const cookies = this.parseCookies(cookieHeader);
+
+    if (cookies.log_auth === this.env.LOG_PASSWORD) {
+      // 已登录，显示日志页面
+      return await this.getLogViewerHTML();
+    }
+
+    // 检查是否被锁定
+    const attempts = this.loginAttempts.get(clientIp) || {
+      count: 0,
+      lockUntil: 0,
+    };
+    if (attempts.lockUntil > Date.now()) {
+      return new Response(this.getLogLoginHTML("密码错误次数过多，已锁定！"), {
+        status: 429,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // 处理登录提交
+    if (request.method === "POST") {
+      const formData = await request.formData();
+      const password = formData.get("password");
+
+      if (password === this.env.LOG_PASSWORD) {
+        // 登录成功，设置cookie
+        const expires = new Date();
+        expires.setTime(expires.getTime() + 1 * 60 * 60 * 1000); // 1小时
+
+        const response = new Response(this.getLogViewerHTML(), {
+          status: 200,
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": `log_auth=${
+              this.env.LOG_PASSWORD
+            }; expires=${expires.toUTCString()}; path=/`,
+          },
+        });
+
+        // 清除失败计数
+        this.loginAttempts.delete(clientIp);
+        return response;
+      } else {
+        // 登录失败
+        attempts.count++;
+        if (attempts.count >= 3) {
+          attempts.lockUntil = Date.now() + 60 * 60 * 1000; // 锁定1小时
+        }
+        this.loginAttempts.set(clientIp, attempts);
+
+        return new Response(this.getLogLoginHTML("密码错误，请重试"), {
+          status: 401,
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+      }
+    }
+
+    // 显示登录页面
+    return new Response(this.getLogLoginHTML(), {
+      status: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
+
+  // 获取日志登录页面HTML
+  getLogLoginHTML(errorMessage = null) {
+    return `<!DOCTYPE html>      
+<html lang="zh-CN">      
+<head>      
+    <meta charset="UTF-8">      
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">      
+    <title>日志验证 - VNT</title>      
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>      
+    <style>      
+        * {      
+            margin: 0;      
+            padding: 0;      
+            box-sizing: border-box;      
+        }      
+              
+        body {      
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;      
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);      
+            min-height: 100vh;      
+            animation: gradientShift 10s ease infinite;      
+            display: flex;      
+            align-items: center;      
+            justify-content: center;      
+        }      
+              
+        @keyframes gradientShift {      
+            0%, 100% { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }      
+            50% { background: linear-gradient(135deg, #764ba2 0%, #667eea 100%); }      
+        }      
+              
+        .modal {      
+    		display: block;      
+    		position: relative;      
+    		background: rgba(255, 255, 255, 0.96);      
+    		width: calc(100vw - 48px);     
+    		max-width: 400px;       
+    		min-width: 280px;     
+    		padding: 36px 32px;      
+    		border-radius: 16px;      
+    		box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);      
+    		backdrop-filter: blur(10px);      
+    		animation: modalSlideIn 0.3s ease;      
+	}     
+              
+        @keyframes modalSlideIn {      
+            from {      
+                opacity: 0;      
+                transform: translateY(-50px);      
+            }      
+            to {      
+                opacity: 1;      
+                transform: translateY(0);      
+            }      
+        }      
+              
+        .modal h2 {      
+            margin-bottom: 30px;      
+            text-align: center;      
+            background: linear-gradient(45deg, #667eea, #764ba2);      
+            -webkit-background-clip: text;      
+            -webkit-text-fill-color: transparent;      
+            font-size: 24px;      
+        }      
+              
+        .form-group {      
+            margin-bottom: 20px;      
+        }      
+              
+        .form-group label {      
+            display: block;      
+            margin-bottom: 8px;      
+            font-weight: 500;      
+            color: #333;      
+        }      
+              
+        .form-group input {      
+            width: 100%;      
+            padding: 12px;      
+            border: 2px solid #e0e0e0;      
+            border-radius: 8px;      
+            font-size: 14px;      
+            transition: border-color 0.3s ease;      
+        }      
+              
+        .form-group input:focus {      
+            outline: none;      
+            border-color: #667eea;      
+        }      
+              
+        .submit-btn {      
+    		display: block;      
+    		margin: 0 auto;      
+    		padding: 12px 40px;     
+    		background: linear-gradient(45deg, #667eea, #764ba2);      
+    		color: white;      
+    		border: none;      
+    		border-radius: 8px;      
+    		font-size: 16px;      
+    		font-weight: 500;      
+    		cursor: pointer;      
+    		transition: all 0.3s ease;      
+	}      
+              
+        .submit-btn:hover {      
+            transform: translateY(-2px);      
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);      
+        }      
+              
+        /* 错误提示样式 */    
+        .error-message {      
+            background: #ffebee;      
+            color: #c62828;      
+            padding: 12px;      
+            border-radius: 8px;      
+            margin-bottom: 20px;      
+            border: 1px solid #ef5350;      
+            font-size: 14px;      
+            animation: errorShake 0.5s ease;      
+        }      
+              
+        @keyframes errorShake {      
+            0%, 100% { transform: translateX(0); }      
+            25% { transform: translateX(-5px); }      
+            75% { transform: translateX(5px); }      
+        }      
+    </style>      
+</head>      
+<body>      
+    <div id="app">      
+        <div class="modal">      
+            <h2>日志验证</h2>  
+            <form method="POST" action="" @submit.prevent="login">    
+            <!-- 错误提示区域 -->    
+            <div v-if="showError" class="error-message">{{ errorMessage }}</div>      
+            <div class="form-group">      
+                <!-- <label>日志密码：</label> -->  
+                <input v-model="loginForm.password" type="password" placeholder="请输入日志密码" @keyup.enter="login" />      
+            </div>      
+            <button class="submit-btn">确认登录</button> 
+            </form>     
+        </div>      
+    </div>      
+    <script>      
+        const { createApp } = Vue;      
+        createApp({      
+            data() {      
+                return {      
+                    loginForm: {      
+                        password: ''      
+                    },      
+                    showError: ${errorMessage ? "true" : "false"},      
+                    errorMessage: ${
+                      errorMessage ? JSON.stringify(errorMessage) : "''"
+                    }      
+                };      
+            },      
+            methods: {      
+                login() {      
+                    if (!this.loginForm.password) {      
+                        this.showError = true;      
+                        this.errorMessage = '请输入密码！';      
+                        return;      
+                    }      
+                          
+                    // 设置1小时有效期的cookies      
+                    const expires = new Date();      
+                    expires.setTime(expires.getTime() + (1 * 60 * 60 * 1000));      
+                          
+                    document.cookie = \`log_auth=\${this.loginForm.password}; expires=\${expires.toUTCString()}; path=/\`;      
+                          
+                    event.target.submit();     
+                }      
+            }      
+        }).mount('#app');      
+    </script>      
+</body>      
+</html>`;
+  }
+
+  // 获取日志查看页面HTML
+  async getLogViewerHTML() {
+    try {
+      // 从storage获取日志
+      const logData = (await this.state.storage.get("operationLogs")) || [];
+
+      const htmlContent = `<!DOCTYPE html>  
+<html lang="zh-CN">  
+<head>  
+    <meta charset="UTF-8">  
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">  
+    <title>服务日志 - VNT</title>  
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>  
+    <style>  
+        * { margin: 0; padding: 0; box-sizing: border-box; }  
+        body {  
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;  
+            background: #f5f5f5;  
+        }  
+        .header {  
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);  
+            color: white;  
+            padding: 20px;  
+            display: flex;  
+            justify-content: space-between;  
+            align-items: center;  
+        }  
+        .title {  
+            font-size: 24px;  
+            font-weight: bold;  
+        }  
+        .logout-btn, .clear-btn {  
+            background: rgba(255, 255, 255, 0.2);  
+            color: white;  
+            border: 1px solid rgba(255, 255, 255, 0.3);  
+            padding: 8px 16px;  
+            border-radius: 20px;  
+            cursor: pointer;  
+            transition: all 0.3s ease;  
+            margin-left: 10px;  
+        }  
+        .logout-btn:hover, .clear-btn:hover {  
+            background: rgba(255, 255, 255, 0.3);  
+        }  
+        .clear-btn {  
+            background: rgba(244, 67, 54, 0.8);  
+            border-color: rgba(244, 67, 54, 0.9);  
+        }  
+        .clear-btn:hover {  
+            background: rgba(244, 67, 54, 0.9);  
+        }  
+        .container {  
+            max-width: 1200px;  
+            margin: 0 auto;  
+            padding: 20px;  
+        }  
+        .log-container {  
+            background: white;  
+            border-radius: 10px;  
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);  
+            overflow: hidden;  
+        }  
+        .log-item {  
+            padding: 12px 20px;  
+            border-bottom: 1px solid #f0f0f0;  
+            font-family: 'Consolas', 'Monaco', monospace;  
+            font-size: 13px;  
+            line-height: 1.5;  
+        }  
+        .log-item:last-child {  
+            border-bottom: none;  
+        }  
+        .log-time {  
+            color: #666;  
+            margin-right: 15px;  
+        }  
+        .log-level {  
+            padding: 2px 8px;  
+            border-radius: 4px;  
+            font-weight: bold;  
+            margin-right: 15px;  
+            min-width: 50px;  
+            text-align: center;  
+        }  
+        .level-error {  
+            background: #ffebee;  
+            color: #c62828;  
+        }  
+        .level-warn {  
+            background: #fff3e0;  
+            color: #ef6c00;  
+        }  
+        .level-info {  
+            background: #e3f2fd;  
+            color: #1565c0;  
+        }  
+        .level-debug {  
+            background: #f3e5f5;  
+            color: #7b1fa2;  
+        }  
+        .log-message {  
+            color: #333;  
+        }  
+        .empty-logs {  
+            text-align: center;  
+            padding: 60px 20px;  
+            color: #999;  
+        }
+        /* 成功提示样式 */  
+	.success-message {  
+    		background: #e8f5e8;  
+    		color: #2e7d32;  
+    		padding: 12px;  
+    		border-radius: 8px;  
+    		margin-bottom: 20px;  
+    		border: 1px solid #4caf50;  
+    		font-size: 14px;  
+    		animation: successSlideIn 0.5s ease;  
+	}  
+  
+	@keyframes successSlideIn {  
+    		from {  
+        		opacity: 0;  
+        		transform: translateY(-20px);  
+    		}  
+    		to {  
+        		opacity: 1;  
+        		transform: translateY(0);  
+    		}  
+	}
+	/* 错误提示样式 */  
+	.error-message {  
+    		background: #ffebee;  
+    		color: #c62828;  
+    		padding: 12px;  
+    		border-radius: 8px;  
+    		margin-bottom: 20px;  
+    		border: 1px solid #ef5350;  
+    		font-size: 14px;  
+    		animation: errorShake 0.5s ease;  
+	}  
+  
+	@keyframes errorShake {  
+    		0%, 100% { transform: translateX(0); }  
+    		25% { transform: translateX(-5px); }  
+    		75% { transform: translateX(5px); }  
+	}
+	.back-to-top {
+    		position: fixed;
+    		bottom: 20px;
+    		right: 20px;
+    		width: 50px;
+    		height: 50px;
+    		border-radius: 50%;
+    		background: linear-gradient(135deg, #667eea, #764ba2);
+    		color: white;
+    		font-size: 24px;
+    		font-weight: bold;
+    		text-align: center;
+    		cursor: pointer;
+    		box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    		transition: all 0.3s ease;
+    		z-index: 9999;
+    		justify-content: center;
+    		align-items: center;
+    		opacity: 0;
+    		pointer-events: none;
+	}
+	.back-to-top.show {
+    		opacity: 1;
+    		pointer-events: auto;
+	}
+	.back-to-top:hover {
+    		transform: translateY(-2px);
+    		box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+	}
+    </style>  
+</head>  
+<body>  
+    <div id="app">  
+        <div class="header">  
+            <div class="title">服务运行日志</div>  
+            <div>  
+                <button class="clear-btn" @click="clearLogs">清空日志</button>  
+                <button class="logout-btn" @click="logout">退出</button>  
+            </div>  
+        </div>  
+        <div class="container">
+        	<!-- 提示消息区域 -->  
+    		<div v-if="showNotification"   
+         		:class="notificationType === 'success' ? 'success-message' : 'error-message'">  
+        		{{ notificationMessage }}  
+    		</div>
+            <div class="log-container">  
+                <div v-if="logs.length === 0" class="empty-logs">  
+                    暂无日志记录  
+                </div>  
+                <div v-for="log in logs" :key="log.timestamp" class="log-item" ref="logItems">  
+                    <span class="log-time">{{ formatTime(log.timestamp) }}</span>  
+                    <span :class="'log-level level-' + log.level">{{ log.level.toUpperCase() }}</span>  
+                    <span class="log-message">{{ log.message }}</span>  
+                </div>  
+            </div>  
+        </div>
+    <button class="back-to-top" @click="scrollToTop" :class="{ show: showBackToTop }">🔝</button>
+    </div>
+    <script>  
+        const { createApp } = Vue;  
+        createApp({  
+            data() {  
+                return {  
+                    logs: ${JSON.stringify(logData)},
+                    showBackToTop: false,
+                    showNotification: false,  
+                    notificationType: '',  
+                    notificationMessage: ''
+                };  
+            },  
+            mounted() {
+            	window.addEventListener('scroll', this.handleScroll);
+                // 自动滚动到底部  
+                this.$nextTick(() => {  
+                    if (this.$refs.logItems && this.$refs.logItems.length > 0) {  
+                        const lastItem = this.$refs.logItems[this.$refs.logItems.length - 1];  
+                        lastItem.scrollIntoView({ behavior: 'smooth' });  
+                    }  
+                });  
+            },
+            beforeUnmount() {  
+    		window.removeEventListener('scroll', this.handleScroll);  
+	    },  
+            methods: {
+            	handleScroll() {  
+        		// 当滚动超过200px时显示按钮  
+        		this.showBackToTop = window.scrollY > 200;  
+    	 	},  
+    		scrollToTop() {  
+        		window.scrollTo({  
+            			top: 0,  
+            			behavior: 'smooth'  
+        		});  
+    		},
+                formatTime(timestamp) {  
+                    const date = new Date(timestamp);  
+                    return date.toLocaleString('zh-CN', {  
+                        year: 'numeric',  
+                        month: '2-digit',  
+                        day: '2-digit',  
+                        hour: '2-digit',  
+                        minute: '2-digit',  
+                        second: '2-digit'  
+                    });  
+                },  
+                logout() {  
+                    document.cookie = 'log_auth=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';  
+                    window.location.reload();  
+                },  
+                async clearLogs() {
+                	if (!confirm('确定要清空所有日志吗？此操作不可恢复！')) {  
+        			return;  
+    			}
+    			try {  
+        			const response = await fetch(window.location.href + '/clear', {  
+            			method: 'POST',  
+            			headers: {  
+                			'Content-Type': 'application/json'  
+            			}  
+        		});  
+          
+        		const result = await response.json();  
+          
+        		if (response.ok && result.status === 'ok') {  
+            			this.logs = [];  
+            			this.showNotification = true;  
+            			this.notificationType = 'success';  
+            			this.notificationMessage = '日志已成功清空';  
+        		} else {  
+            			this.showNotification = true;  
+            			this.notificationType = 'error';  
+            			this.notificationMessage = result.error || result.message || '清空日志失败';  
+        		}  
+          
+        		// 4秒后自动隐藏提示  
+        		setTimeout(() => {  
+            			this.showNotification = false;  
+       		 }, 4000);  
+          
+    			} catch (error) {  
+        			this.showNotification = true;  
+        			this.notificationType = 'error';  
+        			this.notificationMessage = '网络错误，请稍后重试';  
+          
+        			setTimeout(() => {  
+            				this.showNotification = false;  
+        			}, 3000);  
+    			}  
+		} 
+            }  
+        }).mount('#app');  
+    </script>  
+</body>  
+</html>`;
+      return new Response(htmlContent, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    } catch (error) {
+      return new Response(
+        `<html><body><h1>错误</h1><p>${error.message}</p></body></html>`,
+        {
+          status: 500,
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        }
+      );
+    }
+  }
+
+  // 处理清空日志
+  async handleClearLogs(request) {
+    const clientIp = this.getClientIp(request);
+    const cookieHeader = request.headers.get("Cookie") || "";
+    const cookies = this.parseCookies(cookieHeader);
+
+    // 验证登录状态
+    if (cookies.log_auth !== this.env.LOG_PASSWORD) {
+      // return new Response("未授权", { status: 401 });
+      // 显示登录页面
+      return new Response(this.getLogLoginHTML(), {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    try {
+      // 清空日志
+      await this.state.storage.delete("operationLogs");
+
+      return new Response(
+        JSON.stringify({
+          status: "ok",
+          message: "日志已清空",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    } catch (error) {
+      return new Response(
+        JSON.stringify({
+          error: "清空失败: " + error.message,
+        }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+  }
+
   async fetch(request) {
     await this.init();
     const clientIp = this.getClientIp(request);
     const url = new URL(request.url);
     // logger.debug(`处理请求: ${url.pathname}`);
     // logger.info(`接收到客户端请求\n请求方法: ${request.method}\n请求路径: ${url.pathname}\n客户端IP: ${clientIp}\n用户代理: ${request.headers.get('User-Agent') || '未知'}\n来源页面: ${request.headers.get('Referer') || '无'}\n查询参数: ${JSON.stringify(Object.fromEntries(url.searchParams))}\n请求时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n内容类型: ${request.headers.get('Content-Type') || '无'}\n内容长度: ${request.headers.get('Content-Length') || '0'}\n请求协议: ${url.protocol}\n主机名: ${url.hostname}\n端口: ${url.port || '无'}`);
+
     const wsPath = "/" + this.env.WS_PATH || "/vnt";
     if (url.pathname === wsPath) {
-      logger.debug(`WebSocket连接请求，开始处理`);
-      return this.handleWebSocket(request);
+      logger.info(`客户端IP: ${clientIp} 请求 VNT WebSocket 连接，开始处理`);
+      return this.handleWebSocket(request, clientIp);
     }
 
     // 添加健康检查处理
     if (url.pathname === "/test") {
+      logger.debug(`客户端IP: ${clientIp} 请求 /test 状态查询，开始处理`);
       if (!this.checkRateLimit(clientIp, "test")) {
         return new Response(
           JSON.stringify({
@@ -1633,6 +2404,7 @@ export class RelayRoom {
 
     // 添加设备列表查询处理
     if (url.pathname === "/room") {
+      logger.debug(`客户端IP: ${clientIp} 请求 /room 设备列表查询，开始处理`);
       if (!this.checkRateLimit(clientIp, "room")) {
         return new Response(
           JSON.stringify({
@@ -1654,15 +2426,24 @@ export class RelayRoom {
       return this.handleDeviceListQuery(request);
     }
 
-    // logger.debug(`未知路径: ${url.pathname}，返回404`);
+    if (url.pathname === "/log") {
+      logger.debug(`客户端IP: ${clientIp} 请求 /log 日志查询，开始处理`);
+      return this.handleLogEndpoint(request);
+    }
+    if (url.pathname === "/log/clear") {
+      logger.debug(`客户端IP: ${clientIp} 请求 /log/clear 删除日志，开始处理`);
+      return this.handleClearLogs(request);
+    }
+
+    // logger.debug(`客户端IP: ${clientIp} 请求了未知路径: ${url.pathname}，返回404`);
     return new Response("Not Found", { status: 404 });
   }
 
-  async handleWebSocket(request) {
+  async handleWebSocket(request, clientIp) {
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
 
-    const clientId = this.generateClientId();
+    const clientId = this.generateClientId(clientIp);
     const addr = this.parseClientAddress(request);
 
     // logger.info(`新的WebSocket连接: ${clientId} 来自 ${JSON.stringify(addr)}`);
@@ -1957,15 +2738,6 @@ export class RelayRoom {
         const transport = uint8Data[2];
         // logger.debug(`快速转发: 协议=${protocol}, 传输=${transport}`);
 
-        // 在快速转发中也检查 P2P 连接
-        const header = parseVNTHeaderFast(uint8Data);
-        if (header && header.destination) {
-          if (this.hasP2PConnection(clientId, header.destination)) {
-            // logger.debug(`快速路径: ${clientId} 到 ${header.destination} 有P2P连接，跳过转发`);
-            return;
-          }
-        }
-
         return await this.fastForward(clientId, uint8Data);
       }
 
@@ -1976,44 +2748,11 @@ export class RelayRoom {
         return await this.fullParsingPath(clientId, uint8Data);
       }
 
-      // 数据包智能处理 - 参照 vnts 的优先 P2P 逻辑
-      if (header.isDataPacket && !(uint8Data[1] === 4 && uint8Data[2] === 1)) {
-        const targetIp = header.destination;
-
-        // 优先检查 P2P 连接 - 类似 vnts 的 route_one_p2p 逻辑
-        if (this.hasP2PConnection(clientId, targetIp)) {
-          // logger.debug(`${clientId} 到 ${targetIp} 有P2P连接，跳过转发`);
-          return; // 让客户端直连，不中继
-        }
-
-        // 没有 P2P 连接，尝试直接转发
-        const targetClient = this.findClientByIp(targetIp);
-        if (targetClient && targetClient !== clientId) {
-          const server = this.connections.get(targetClient);
-          if (server && server.readyState === WebSocket.OPEN) {
-            server.send(uint8Data);
-            return;
-          }
-        }
-
-        // 目标不在线或无法直连，才考虑服务器中继
-        if (this.env.DISABLE_RELAY !== "1") {
-          return await this.relayPacket(clientId, uint8Data, header);
-        }
-      }
-
       // 控制包和服务包需要完整解析
       if (header.isControlPacket || header.isServicePacket) {
         return await this.fullParsingPath(clientId, uint8Data);
       }
 
-      // 其他情况默认广播（但也要检查 P2P）
-      if (header.destination) {
-        if (this.hasP2PConnection(clientId, header.destination)) {
-          // logger.debug(`广播路径: ${clientId} 到 ${header.destination} 有P2P连接，跳过转发`);
-          return;
-        }
-      }
       return await this.fastForward(clientId, uint8Data);
     } catch (error) {
       logger.error(`处理 ${clientId} 消息时出错:`, error);
@@ -2064,7 +2803,7 @@ export class RelayRoom {
   async fullParsingPath(clientId, data) {
     const packet = NetPacket.parse(data);
     const context = this.contexts.get(clientId);
-    const addr = this.parseClientAddress({ cf: { colo: "unknown" } });
+    const addr = context?.linkAddress || { ip: "unknown", port: 0 };
 
     // logger.debug(`开始完整VNT解析，客户端: ${clientId}`);
     // logger.debug(`数据包协议: ${packet.protocol}, 传输协议: ${packet.transportProtocol}`);
@@ -2100,16 +2839,8 @@ export class RelayRoom {
       }
     }
 
-    // VNT 协议的广播逻辑 - 添加 P2P 检查
+    // VNT 协议的广播逻辑
     if (this.shouldBroadcast(packet)) {
-      // 检查广播目标是否有 P2P 连接
-      if (
-        packet.destination &&
-        this.hasP2PConnection(clientId, packet.destination)
-      ) {
-        // logger.debug(`广播包 ${clientId} 到 ${this.packetHandler.formatIp(packet.destination)} 有P2P连接，跳过服务器广播`);
-        return;
-      }
       // logger.info(`开始广播数据包，来源客户端: ${clientId}`);
       await this.broadcastPacket(clientId, packet);
     }
@@ -2247,31 +2978,43 @@ export class RelayRoom {
     if (this.connections.size === 0 && this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
       this.healthCheckInterval = null;
-      logger.info(`所有连接已断开，停止健康检查定时器`);
+      logger.debug(`所有连接已断开，停止健康检查定时器`);
     }
 
     logger.info(`连接 ${clientId} 清理完成`);
     logger.info(`>========================<`);
   }
 
-  generateClientId() {
-    const clientId = Math.random().toString(36).substr(2, 9);
-    logger.debug(`生成客户端ID: ${clientId}`);
+  generateClientId(clientIp) {
+    const randomPart = Math.random().toString(36).substr(2, 9);
+    const clientId = `${clientIp}_${randomPart}`;
+    // logger.debug(`生成客户端ID: ${clientId}`);
     return clientId;
   }
 
   parseClientAddress(request) {
-    const cf = request.cf;
+    // 优先从CF-Connecting-IP获取真实IP（不区分大小写）
+    const headers = {};
+
+    // 将所有header转换为小写key，实现不区分大小写查找
+    for (const [key, value] of request.headers.entries()) {
+      headers[key.toLowerCase()] = value;
+    }
+
     const address = {
-      ip: cf?.colo || "unknown",
+      ip:
+        headers["cf-connecting-ip"] ||
+        headers["x-real-ip"] ||
+        headers["x-forwarded-for"] ||
+        "unknown",
       port: 0,
     };
+
     // logger.debug(`解析客户端地址: ${JSON.stringify(address)}`);
     return address;
   }
-
   checkConnectionHealth() {
-    logger.info(`开始健康检查，当前连接数: ${this.connections.size}`);
+    logger.debug(`开始健康检查，当前连接数: ${this.connections.size}`);
 
     let cleanedCount = 0;
     for (const [clientId, server] of this.connections) {
@@ -2282,6 +3025,6 @@ export class RelayRoom {
       }
     }
 
-    logger.info(`健康检查完成，清理了 ${cleanedCount} 个断开的连接`);
+    logger.debug(`健康检查完成，清理了 ${cleanedCount} 个断开的连接`);
   }
 }

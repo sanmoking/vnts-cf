@@ -5,9 +5,9 @@
   "main": "src/worker.js",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --ip 0.0.0.0 --var VERSION:$(date +%s)",
-    "start": "wrangler deploy --var VERSION:$(date +%s)",
-    "deploy": "wrangler deploy --var VERSION:$(date +%s)",
+    "dev": "wrangler dev --ip 0.0.0.0",
+    "start": "wrangler deploy",
+    "deploy": "wrangler deploy",
     "tail": "wrangler tail"
   },
   "devDependencies": {

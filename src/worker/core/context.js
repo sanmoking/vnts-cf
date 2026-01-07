@@ -63,7 +63,11 @@ class ExpireMap {
 
     for (const [key, item] of this.map.entries()) {
       if (now > item.expireTime) {
-        // logger.debug(`[过期映射-清理] 删除过期项: ${key} (过期于: ${new Date(item.expireTime).toISOString()})`);
+        logger.debug(
+          `[过期映射-清理] 删除过期项: ${key} (过期于: ${formatBeijingTime(
+            new Date(item.expireTime)
+          )})`
+        );
         this.map.delete(key);
         if (this.onExpire) {
           this.onExpire(key, item.value);
@@ -73,7 +77,9 @@ class ExpireMap {
     }
 
     if (cleanedCount > 0) {
-      // logger.debug(`[过期映射-清理] 清理完成，删除了 ${cleanedCount} 个过期项，剩余 ${this.map.size} 项`);
+      logger.debug(
+        `[过期映射-清理] 清理完成，删除了 ${cleanedCount} 个过期项，剩余 ${this.map.size} 项`
+      );
     } else {
       // logger.debug(`[过期映射-清理] 无过期项需要清理`);
     }
@@ -95,6 +101,44 @@ class ExpireMap {
       // logger.debug(`[过期映射-销毁] 已清理 ${itemCount} 个剩余项，ExpireMap已完全销毁`);
     }
   }
+  // 序列化 ExpireMap
+  serialize() {
+    const entries = [];
+    for (const [key, item] of this.map.entries()) {
+      entries.push({
+        key: key,
+        value: item.value,
+        expireTime: item.expireTime,
+      });
+    }
+    return {
+      ttlMs: this.ttlMs,
+      entries: entries,
+    };
+  }
+
+  // 反序列化 ExpireMap（静态方法）
+  static deserialize(data, onExpire = null) {
+    const expireMap = new ExpireMap(data.ttlMs, onExpire);
+
+    // 清除自动创建的定时器，因为我们会手动恢复数据
+    if (expireMap.cleanupTimer) {
+      clearInterval(expireMap.cleanupTimer);
+    }
+
+    // 恢复所有条目
+    for (const entry of data.entries) {
+      expireMap.map.set(entry.key, {
+        value: entry.value,
+        expireTime: entry.expireTime,
+      });
+    }
+
+    // 重新启动清理定时器
+    expireMap.startCleanupTimer();
+
+    return expireMap;
+  }
 }
 /**
  * VNT 连接上下文
@@ -111,7 +155,7 @@ export class VntContext {
    * 离开连接，清理资源
    * 对应 Rust 中的 leave 方法
    */
-  async leave(cache) {
+  async leave(cache, relayRoom = null) {
     // logger.debug(`[连接清理-开始] 开始清理客户端连接资源`);
     // 清理服务端加密会话
     if (this.server_cipher) {
@@ -144,11 +188,21 @@ export class VntContext {
           clientInfo.tcp_sender = null;
           clientInfo.offline_timestamp = Date.now(); // 记录离线时间
           networkInfo.epoch += 1;
-          logger.info(
-            `[客户端离线] 主机名:${clientInfo.name} ID:${
-              clientInfo.device_id
-            } IP:${formatIp(this.link_context.virtual_ip)} 已离线`
+          clientInfo.offline_timestamp = Date.now();
+          const cleanupTime = new Date(
+            clientInfo.offline_timestamp + 24 * 3600 * 1000
           );
+          logger.info(
+            `[客户端离线] 主机名:${clientInfo.name}, 设备ID:${
+              clientInfo.device_id
+            }, 设备IP:${formatIp(
+              this.link_context.virtual_ip
+            )} 已离线，将于 ${formatBeijingTime(cleanupTime)} 清理`
+          );
+          // 客户端状态变化，立即保存到存储
+          if (relayRoom) {
+            await relayRoom.syncSaveAppCache();
+          }
         }
 
         // 插入 IP 会话记录，设置1天过期
@@ -160,6 +214,22 @@ export class VntContext {
     }
     // logger.debug(`[连接清理-完成] 客户端连接资源清理完成`);
   }
+}
+
+function formatBeijingTime(isoString) {
+  const date = isoString instanceof Date ? isoString : new Date(isoString);
+
+  // 转换为北京时间（UTC+8）
+  const beijingTime = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+
+  const year = beijingTime.getFullYear();
+  const month = String(beijingTime.getMonth() + 1).padStart(2, "0");
+  const day = String(beijingTime.getDate()).padStart(2, "0");
+  const hours = String(beijingTime.getHours()).padStart(2, "0");
+  const minutes = String(beijingTime.getMinutes()).padStart(2, "0");
+  const seconds = String(beijingTime.getSeconds()).padStart(2, "0");
+
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
 // 格式化IP
@@ -199,6 +269,42 @@ export class NetworkInfo {
   static new(network, netmask, gateway) {
     return new NetworkInfo(network, netmask, gateway);
   }
+  // 序列化 NetworkInfo
+  serialize() {
+    const clientsArray = [];
+    for (const [virtualIp, clientInfo] of this.clients.entries()) {
+      clientsArray.push({
+        virtualIp: virtualIp,
+        clientInfo: clientInfo.serialize(),
+      });
+    }
+
+    return {
+      network: this.network,
+      netmask: this.netmask,
+      gateway: this.gateway,
+      clients: clientsArray,
+      epoch: this.epoch,
+    };
+  }
+
+  // 反序列化 NetworkInfo（静态方法）
+  static deserialize(data) {
+    const networkInfo = new NetworkInfo(
+      data.network,
+      data.netmask,
+      data.gateway
+    );
+    networkInfo.epoch = data.epoch;
+
+    // 恢复所有客户端
+    for (const item of data.clients) {
+      const clientInfo = ClientInfo.deserialize(item.clientInfo);
+      networkInfo.clients.set(item.virtualIp, clientInfo);
+    }
+
+    return networkInfo;
+  }
 }
 
 /**
@@ -223,6 +329,59 @@ export class ClientInfo {
     this.last_join_time = options.lastJoinTime || new Date();
     this.timestamp = options.timestamp || Date.now();
     this.status_update_time = options.status_update_time || null;
+    this.offline_timestamp = options.offline_timestamp || null;
+  }
+  // 序列化 ClientInfo
+  serialize() {
+    return {
+      virtual_ip: this.virtual_ip,
+      device_id: this.device_id,
+      name: this.name,
+      version: this.version,
+      wireguard: this.wireguard,
+      online: this.online,
+      address: this.address,
+      client_secret: this.client_secret,
+      client_secret_hash: this.client_secret_hash
+        ? Array.from(this.client_secret_hash)
+        : [],
+      server_secret: this.server_secret,
+      client_status: this.client_status,
+      last_join_time:
+        this.last_join_time instanceof Date
+          ? this.last_join_time.getTime()
+          : this.last_join_time,
+      timestamp: this.timestamp,
+      status_update_time: this.status_update_time,
+      offline_timestamp: this.offline_timestamp || null,
+    };
+  }
+
+  // 反序列化 ClientInfo（静态方法）
+  static deserialize(data) {
+    return new ClientInfo({
+      virtualIp: data.virtual_ip,
+      device_id: data.device_id,
+      name: data.name,
+      version: data.version,
+      wireguard: data.wireguard,
+      online: data.online,
+      address: data.address,
+      clientSecret: data.client_secret,
+      clientSecretHash: data.client_secret_hash
+        ? new Uint8Array(data.client_secret_hash)
+        : new Uint8Array(0),
+      serverSecret: data.server_secret,
+      tcpSender: null, // WebSocket 连接无法序列化，恢复时为 null
+      wgSender: null,
+      clientStatus: data.client_status,
+      lastJoinTime: data.last_join_time
+        ? new Date(data.last_join_time)
+        : new Date(),
+      timestamp: data.timestamp,
+      status_update_time: data.status_update_time,
+      offline_timestamp: data.offline_timestamp || null,
+    });
   }
 }
 
@@ -231,23 +390,30 @@ export class ClientInfo {
  * 对应 Rust 中的 AppCache
  */
 export class AppCache {
-  constructor() {
+  constructor(relayRoom = null) {
+    this.relayRoom = relayRoom;
     // logger.debug(`[应用缓存-初始化] 开始初始化AppCache`);
     // 虚拟网络映射：group -> NetworkInfo (7天过期)
     // logger.debug(`[应用缓存-网络] 创建虚拟网络映射，TTL: 7天`);
     this.virtual_network = new ExpireMap(
       7 * 24 * 3600 * 1000,
-      (key, networkInfo) => {
+      async (key, networkInfo) => {
         // 网络过期时检查是否有客户端
         if (networkInfo.clients.size === 0) {
-          // logger.debug(`[应用缓存-网络] 网络过期并清理: ${key}`);
+          logger.debug(
+            `[Token过期] Token: ${key} 超过7天未活跃，无活跃客户端，即将清理`
+          );
+        } else {
+          logger.debug(
+            `[Token过期] Token: ${key} 超过7天未活跃，但仍有 ${networkInfo.clients.size} 个离线客户端，稍后清理`
+          );
         }
       }
     );
 
     // IP 会话映射：(group, ip) -> address (1天过期)
     // logger.debug(`[应用缓存-会话] 创建IP会话映射，TTL: 1天`);
-    this.ip_session = new ExpireMap(24 * 3600 * 1000, (key, address) => {
+    this.ip_session = new ExpireMap(24 * 3600 * 1000, async (key, address) => {
       // IP过期时清理离线客户端
       const [group, ip] = JSON.parse(key);
       const networkInfo = this.virtual_network.get(group);
@@ -265,8 +431,12 @@ export class AppCache {
           logger.info(
             `[客户端清理] 设备 ${clientInfo.name} (${
               clientInfo.device_id
-            }) IP ${this.formatIp(ip)} 离线超过1天，已清理`
+            }) IP ${this.formatIp(ip)} 离线超过1天，即将清理`
           );
+          // epoch 变化时触发保存
+          if (this.relayRoom) {
+            await this.relayRoom.syncSaveAppCache();
+          }
         }
       }
     });
@@ -301,6 +471,123 @@ export class AppCache {
     this.ip_session.destroy();
     this.cipher_session.destroy();
     this.auth_map.destroy();
+  }
+  // 序列化整个 AppCache
+  serialize() {
+    // 序列化 virtual_network (ExpireMap<string, NetworkInfo>)
+    const virtualNetworkData = this.virtual_network.serialize();
+
+    // 将 NetworkInfo 对象序列化
+    virtualNetworkData.entries = virtualNetworkData.entries.map((entry) => ({
+      key: entry.key,
+      value: entry.value.serialize(), // 调用 NetworkInfo 的 serialize
+      expireTime: entry.expireTime,
+    }));
+
+    // 序列化 ip_session
+    const ipSessionData = this.ip_session.serialize();
+
+    // cipher_session 不序列化（包含加密对象，无法序列化）
+    // auth_map 可以序列化
+    const authMapData = this.auth_map.serialize();
+
+    // wg_group_map 序列化为数组
+    const wgGroupMapArray = [];
+    for (const [key, value] of this.wg_group_map.entries()) {
+      wgGroupMapArray.push({ key, value });
+    }
+
+    return {
+      version: "1.0",
+      timestamp: Date.now(),
+      virtual_network: virtualNetworkData,
+      ip_session: ipSessionData,
+      auth_map: authMapData,
+      wg_group_map: wgGroupMapArray,
+    };
+  }
+
+  // 反序列化整个 AppCache（静态方法）
+  static deserialize(data, relayRoom = null) {
+    const cache = new AppCache(relayRoom);
+
+    try {
+      // 停止自动创建的定时器
+      cache.virtual_network.destroy();
+      cache.ip_session.destroy();
+      cache.cipher_session.destroy();
+      cache.auth_map.destroy();
+
+      // 反序列化 virtual_network
+      const virtualNetworkData = data.virtual_network;
+
+      // 先反序列化 NetworkInfo 对象
+      virtualNetworkData.entries = virtualNetworkData.entries.map((entry) => ({
+        key: entry.key,
+        value: NetworkInfo.deserialize(entry.value),
+        expireTime: entry.expireTime,
+      }));
+
+      // 创建 ExpireMap 的回调函数
+      const networkExpireCallback = (key, networkInfo) => {
+        if (networkInfo.clients.size === 0) {
+          logger.debug(`[应用缓存-网络] 网络过期并清理: ${key}`);
+        }
+      };
+
+      const ipSessionExpireCallback = (key, address) => {
+        const [group, ip] = JSON.parse(key);
+        const networkInfo = cache.virtual_network.get(group);
+        if (networkInfo) {
+          const clientInfo = networkInfo.clients.get(ip);
+          if (
+            clientInfo &&
+            !clientInfo.online &&
+            clientInfo.address === address &&
+            clientInfo.offline_timestamp &&
+            Date.now() - clientInfo.offline_timestamp >= 24 * 3600 * 1000
+          ) {
+            networkInfo.clients.delete(ip);
+            networkInfo.epoch += 1;
+            logger.info(
+              `[客户端清理] 设备 ${clientInfo.name} (${
+                clientInfo.device_id
+              }) IP ${
+                relayRoom ? relayRoom.packetHandler.formatIp(ip) : ip
+              } 离线超过1天，已清理`
+            );
+          }
+        }
+      };
+
+      // 反序列化 ExpireMap
+      cache.virtual_network = ExpireMap.deserialize(
+        virtualNetworkData,
+        networkExpireCallback
+      );
+      cache.ip_session = ExpireMap.deserialize(
+        data.ip_session,
+        ipSessionExpireCallback
+      );
+      cache.auth_map = ExpireMap.deserialize(data.auth_map);
+
+      // cipher_session 保持为空的新实例（无法恢复加密会话）
+      cache.cipher_session = new ExpireMap(3600 * 1000);
+
+      // 反序列化 wg_group_map
+      cache.wg_group_map = new Map();
+      for (const item of data.wg_group_map) {
+        cache.wg_group_map.set(item.key, item.value);
+      }
+
+      // logger.debug(`[AppCache-恢复] 成功从存储恢复 AppCache，网络数量: ${cache.virtual_network.map.size}`);
+
+      return cache;
+    } catch (error) {
+      logger.error(`[AppCache-恢复] 恢复失败: ${error.message}`, error);
+      // 如果恢复失败，返回新的空 AppCache
+      return new AppCache();
+    }
   }
 }
 

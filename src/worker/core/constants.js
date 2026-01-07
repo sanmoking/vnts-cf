@@ -36,6 +36,33 @@ export const IP_TURN_TRANSPORT_PROTOCOL = {
   Ipv4Broadcast: 3,
 };
 
+// 错误消息常量 - 与vnts保持一致
+export const ERROR_MESSAGES = {
+  TOKEN_ERROR: "Token Error",
+  DISCONNECT: "Disconnect",
+  ADDRESS_EXHAUSTED: "Address Exhausted",
+  IP_ALREADY_EXISTS: "Ip Already Exists",
+  INVALID_IP: "Invalid Ip",
+  NO_KEY: "No Key",
+  REGISTRATION_FAILED: "Registration failed",
+  DECRYPTION_FAILED: "Decryption failed",
+  INVALID_PACKET_SEQUENCE: "Invalid packet sequence",
+  NO_CONTEXT: "No context",
+  SECRET_HANDSHAKE_FAILED: "Secret handshake failed",
+  NO_RSA_CIPHER: "No RSA cipher configured",
+  INVALID_HANDSHAKE_REQUEST: "Invalid handshake request",
+};
+
+// 错误码映射 - 与vnts保持一致
+export const ERROR_CODES = {
+  TOKEN_ERROR: 1,
+  DISCONNECT: 2,
+  ADDRESS_EXHAUSTED: 3,
+  IP_ALREADY_EXISTS: 4,
+  INVALID_IP: 5,
+  NO_KEY: 6,
+};
+
 export const PACKET_HEADER_SIZE = 12;
 export const ENCRYPTION_RESERVED = 16;
 export const MAGIC = 0x76774e54; // "vwtN" - VNT magic number

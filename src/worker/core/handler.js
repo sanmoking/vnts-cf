@@ -4,6 +4,8 @@ import {
   TRANSPORT_PROTOCOL,
   IP_TURN_TRANSPORT_PROTOCOL,
   ENCRYPTION_RESERVED,
+  ERROR_MESSAGES,
+  ERROR_CODES,
 } from "./constants.js";
 import {
   VntContext,
@@ -90,6 +92,12 @@ export class PacketHandler {
   }
 
   async handle(context, packet, addr, tcpSender) {
+    // 添加 context 空值检查
+    if (!context) {
+      logger.error("[数据包处理] context 为空或未定义");
+      const gateway = this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
+      return this.createErrorPacket(addr, packet.source, "NO_CONTEXT", gateway);
+    }
     try {
       // logger.debug(`数据包路由: 协议=${packet.protocol}, 传输=${packet.transportProtocol}, 是否网关=${packet.is_gateway()}`);
 
@@ -171,13 +179,13 @@ export class PacketHandler {
           return this.createErrorPacket(
             addr,
             source,
-            "Decryption failed",
+            "DECRYPTION_FAILED",
             gateway
           );
         }
       } else {
         logger.warn(`加密数据包无可用密钥`);
-        return this.createErrorPacket(addr, source, "No key", gateway);
+        return this.createErrorPacket(addr, source, "NO_KEY", gateway);
       }
     }
 
@@ -258,6 +266,11 @@ export class PacketHandler {
           connectionInfo.is_cone = statusInfo.is_cone || false;
           connectionInfo.last_status_update = new Date().toISOString();
         }
+      }
+
+      // 客户端状态变化，立即保存到存储
+      if (this.relayRoom) {
+        await this.relayRoom.syncSaveAppCache();
       }
 
       // logger.debug(`[客户端状态] 成功更新客户端 ${this.formatIp(virtualIp)} 状态信息`);
@@ -700,12 +713,12 @@ export class PacketHandler {
     // 返回错误，表示需要先建立上下文
     // logger.warn(`无效的协议组合，需要先建立上下文`);
     const gateway = this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
-    return this.createErrorPacket(addr, packet.source, "No context", gateway);
+    return this.createErrorPacket(addr, packet.source, "NO_CONTEXT", gateway);
   }
 
   async handleHandshake(packet, addr) {
     try {
-      logger.info(`[握手-开始] 开始处理客户端握手请求`);
+      logger.debug(`[握手-开始] 开始处理客户端握手请求`);
       if (this.env.SERVER_ENCRYPT === "true") {
         await this.init();
       }
@@ -761,7 +774,12 @@ export class PacketHandler {
     } catch (error) {
       logger.error(`[握手-错误] 握手处理失败: ${error.message}`, error);
       const gateway = this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
-      return this.createErrorPacket(addr, packet.source, "握手失败", gateway);
+      return this.createErrorPacket(
+        addr,
+        packet.source,
+        "REGISTRATION_FAILED",
+        gateway
+      );
     }
   }
 
@@ -776,7 +794,7 @@ export class PacketHandler {
         return this.createErrorPacket(
           addr,
           packet.source,
-          "No RSA cipher configured",
+          "NO_RSA_CIPHER",
           gateway
         );
       }
@@ -794,7 +812,7 @@ export class PacketHandler {
         return this.createErrorPacket(
           addr,
           packet.source,
-          "Invalid handshake request",
+          "INVALID_HANDSHAKE_REQUEST",
           gateway
         );
       }
@@ -840,17 +858,52 @@ export class PacketHandler {
       return this.createErrorPacket(
         addr,
         packet.source,
-        "Secret handshake failed",
+        "SECRET_HANDSHAKE_FAILED",
         gateway
       );
     }
   }
 
   async handleRegistration(context, packet, addr, tcpSender) {
+    let networkInfo = null;
     // logger.info(`[注册-开始] 处理客户端注册请求，来源: ${JSON.stringify(addr)}`);
     try {
       const payload = packet.payload();
       const registrationReq = this.parseRegistrationRequest(payload);
+
+      if (!registrationReq.token || registrationReq.token.length === 0) {
+        logger.warn(`[注册-失败] Token为空或无效`);
+        const gateway = this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
+        return this.createErrorPacket(
+          addr,
+          packet.source,
+          "TOKEN_ERROR",
+          gateway
+        );
+      }
+      // 检查token白名单
+      if (this.env.WHITE_TOKEN && this.env.WHITE_TOKEN.trim() !== "") {
+        const whiteTokens = this.env.WHITE_TOKEN.split(",")
+          .map((t) => t.trim())
+          .filter((t) => t.length > 0);
+        if (
+          whiteTokens.length > 0 &&
+          !whiteTokens.includes(registrationReq.token)
+        ) {
+          logger.warn(
+            `[注册-拒绝] Token不在白名单，token=${
+              registrationReq.token
+            }，白名单=${JSON.stringify(whiteTokens)}`
+          );
+          const gateway = this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
+          return this.createErrorPacket(
+            addr,
+            packet.source,
+            "TOKEN_ERROR",
+            gateway
+          );
+        }
+      }
       // 获取客户端hash
       let clientSecretHash =
         registrationReq.client_secret_hash || new Uint8Array(0);
@@ -860,7 +913,7 @@ export class PacketHandler {
         // logger.info(`[调试-客户端Hash] 设备: ${registrationReq.name} Hash长度: ${clientSecretHash.length} Hash内容: ${Array.from(clientSecretHash).map((b) => b.toString(16).padStart(2, "0")).join("")} Token: ${registrationReq.token}`);
       }
       logger.info(
-        `[注册-请求] 解析注册请求，设备ID: ${
+        `[注册-请求] 设备ID: ${
           registrationReq.device_id
         }, 名称: ${registrationReq.name}，加密状态: ${
           registrationReq.client_secret
@@ -882,91 +935,8 @@ export class PacketHandler {
       // 更新网段信息（如果是第一个客户端且指定了IP）
       this.updateNetworkSegment(networkInfo, requestedIp, networkInfo.netmask);
 
-      // 检查设备ID是否在线 - 不抛出错误，记录日志并返回错误包
-
-      const gateway = networkInfo.gateway;
-      // logger.info(`[注册-检查] 开始检查设备ID是否在线: ${deviceId}`);
-      const existingDeviceWithSameId = this.findDeviceById(
-        networkInfo,
-        deviceId
-      );
-      if (existingDeviceWithSameId && existingDeviceWithSameId.online) {
-        // 设备ID在线，将之前的设备设为离线
-        logger.warn(
-          `[ID冲突-离线] 设备ID ${deviceId} 已在线，将原设备设为离线，IP: ${this.formatIp(
-            existingDeviceWithSameId.virtual_ip
-          )}`
-        );
-
-        // 设置原设备为离线状态
-        existingDeviceWithSameId.online = false;
-        existingDeviceWithSameId.tcp_sender = null;
-        existingDeviceWithSameId.offline_timestamp = Date.now();
-        networkInfo.epoch += 1;
-
-        logger.info(
-          `[设备离线] 主机名:${existingDeviceWithSameId.name} ID:${
-            existingDeviceWithSameId.device_id
-          } IP:${this.formatIp(existingDeviceWithSameId.virtual_ip)} 已设为离线`
-        );
-
-        // 使用原设备的IP
-        virtualIp = existingDeviceWithSameId.virtual_ip;
-      }
-      // 检查IP是否已被其他设备ID使用 - 不抛出错误，记录日志并返回错误包
-      if (requestedIp !== 0) {
-        // logger.info(`[注册-检查] 开始检查IP冲突: ${this.formatIp(requestedIp)}`);
-        const existingClient = networkInfo.clients.get(requestedIp);
-        if (existingClient && existingClient.online) {
-          if (existingClient.device_id !== deviceId) {
-            // IP被其他设备ID占用，记录警告日志并返回错误包
-            logger.warn(
-              `[IP冲突-其他设备] IP ${this.formatIp(requestedIp)} 被其他设备 ${
-                existingClient.device_id
-              } 占用，当前设备: ${deviceId}`
-            );
-            const errorMessage = `IP已被使用 设备名：${existingClient.name} 设备ID：${existingClient.device_id}`;
-            const errorPayload = new TextEncoder().encode(errorMessage);
-            const errorPacket = NetPacket.new_encrypt(
-              12 + errorPayload.length + ENCRYPTION_RESERVED
-            );
-
-            errorPacket.set_protocol(PROTOCOL.ERROR);
-            errorPacket.set_transport_protocol(4); // IpAlreadyExists
-            errorPacket.set_source(gateway); // 修复：使用 gateway 而不是 packet.gateway
-            errorPacket.set_destination(0xffffffff); // 设置目标地址为客户端
-            errorPacket.set_gateway_flag(true); // 设置网关标志
-            errorPacket.first_set_ttl(15); // 设置TTL
-            errorPacket.set_payload(errorPayload);
-
-            logger.info(`[注册-响应] 返回IP冲突错误包给客户端`);
-            return errorPacket;
-          } else if (existingClient.device_id === deviceId) {
-            // 相同设备ID和IP，且在线，记录警告日志并返回错误包
-            logger.warn(
-              `[IP冲突-已占用] IP ${this.formatIp(
-                requestedIp
-              )} 已被设备 ${deviceId} 占用（重复连接）`
-            );
-            const errorMessage = `IP已被使用 设备名：${existingClient.name} 设备ID：${existingClient.device_id}`;
-            const errorPayload = new TextEncoder().encode(errorMessage);
-            const errorPacket = NetPacket.new_encrypt(
-              12 + errorPayload.length + ENCRYPTION_RESERVED
-            );
-
-            errorPacket.set_protocol(PROTOCOL.ERROR);
-            errorPacket.set_transport_protocol(4); // IpAlreadyExists
-            errorPacket.set_source(gateway); // 修复：使用 gateway 而不是 packet.gateway
-            errorPacket.set_destination(0xffffffff); // 设置目标地址为客户端
-            errorPacket.set_gateway_flag(true); // 设置网关标志
-            errorPacket.first_set_ttl(15); // 设置TTL
-            errorPacket.set_payload(errorPayload);
-
-            logger.info(`[注册-响应] 返回IP重复占用错误包给客户端`);
-            return errorPacket;
-          }
-        }
-      }
+      const gateway =
+        networkInfo.gateway || this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
 
       let virtualIp = requestedIp;
 
@@ -976,8 +946,17 @@ export class PacketHandler {
           networkInfo,
           requestedIp,
           deviceId,
-          allowIpChange
+          allowIpChange,
+          addr,
+          packet,
+          gateway
         );
+
+        // 如果有错误包，直接返回
+        if (conflictCheck.errorPacket) {
+          logger.info(`[注册-响应] 返回IP冲突错误包给客户端`);
+          return conflictCheck.errorPacket;
+        }
 
         if (!conflictCheck.canUse) {
           virtualIp = 0; // 需要重新分配
@@ -993,6 +972,17 @@ export class PacketHandler {
         );
       }
 
+      // 检查分配结果，如果返回 0 表示地址耗尽
+      if (virtualIp === 0) {
+        logger.error(`[IP分配-失败] 地址池已用尽，无法分配IP`);
+        return this.createErrorPacket(
+          addr,
+          packet.source,
+          "ADDRESS_EXHAUSTED",
+          networkInfo.gateway
+        );
+      }
+
       // 创建客户端信息
       // logger.debug(`[注册-客户端] 创建客户端信息对象`);
       const clientInfo = new ClientInfo({
@@ -1002,9 +992,9 @@ export class PacketHandler {
         version: registrationReq.version,
         online: true,
         address: addr,
-        clientSecret: registrationReq.client_secret || false, // 改为 clientSecret
+        clientSecret: registrationReq.client_secret || false,
         clientSecretHash:
-          registrationReq.client_secret_hash || new Uint8Array(0), // 改为 clientSecretHash
+          registrationReq.client_secret_hash || new Uint8Array(0),
         tcp_sender: tcpSender,
         timestamp: Date.now(),
       });
@@ -1013,6 +1003,10 @@ export class PacketHandler {
       // logger.debug(`[注册-网络] 添加客户端到网络，当前网络版本: ${networkInfo.epoch}`);
       networkInfo.epoch += 1;
       networkInfo.clients.set(virtualIp, clientInfo);
+      // 网络结构变化，立即保存到存储
+      if (this.relayRoom) {
+        await this.relayRoom.syncSaveAppCache();
+      }
       // 保存网络信息引用
       this.currentNetworkInfo = networkInfo;
 
@@ -1040,38 +1034,14 @@ export class PacketHandler {
       return response;
     } catch (error) {
       logger.error(`[注册-错误] 注册处理失败: ${error.message}`, error);
+      const gateway = this.parseIpv4(this.env.GATEWAY || "10.26.0.1");
       return this.createErrorPacket(
         addr,
         packet.source,
-        "Registration failed",
+        "REGISTRATION_FAILED",
         networkInfo.gateway
       );
     }
-  }
-
-  // 根据设备ID查找客户端
-  findDeviceById(networkInfo, deviceId) {
-    // logger.debug(`[设备查找] 查找设备ID: ${deviceId}`);
-    // logger.debug(`[设备查找] 当前网络客户端数量: ${networkInfo.clients.size}`);
-
-    // 遍历所有客户端，打印详细信息
-    for (const [ip, client] of networkInfo.clients) {
-      logger.info(
-        `[设备查找] 检查客户端 IP: ${this.formatIp(ip)}, 设备ID: ${
-          client.device_id
-        }, 在线状态: ${client.online}`
-      );
-
-      if (client.device_id === deviceId && client.online) {
-        logger.info(
-          `[设备查找] 找到在线设备: ${deviceId}，IP: ${this.formatIp(ip)}`
-        );
-        return client;
-      }
-    }
-
-    // logger.info(`[设备查找] 未找到在线设备: ${deviceId}`);
-    return null;
   }
 
   getCachedEpoch() {
@@ -1196,7 +1166,7 @@ export class PacketHandler {
       return this.createErrorPacket(
         addr,
         packet.source,
-        "Invalid packet sequence",
+        "INVALID_PACKET_SEQUENCE",
         gateway
       );
     }
@@ -1269,7 +1239,7 @@ export class PacketHandler {
   }
 
   async leave(context) {
-    await context.leave(this.cache);
+    await context.leave(this.cache, this.relayRoom);
   }
 
   // 辅助方法
@@ -1302,29 +1272,33 @@ export class PacketHandler {
     return clientAddress;
   }
 
-  createErrorPacket(addr, destination, message, gateway = null) {
+  createErrorPacket(addr, destination, errorCode, gateway = null) {
     try {
-      logger.info(`[错误包-创建] 开始创建错误包: ${message}`);
+      // 导入错误消息常量
+      const { ERROR_MESSAGES } = require("./constants.js");
 
-      const errorPayload = new TextEncoder().encode(message.substring(0, 100));
+      // 使用标准错误消息，如果找不到则使用默认值
+      const message = ERROR_MESSAGES[errorCode] || errorCode || "Unknown error";
+      logger.info(`[错误包-创建] 创建错误包: ${message} (代码: ${errorCode})`);
 
-      // 修复：计算所需空间
+      const errorPayload = new TextEncoder().encode(message);
       const requiredSize = 12 + errorPayload.length + ENCRYPTION_RESERVED;
       const errorPacket = NetPacket.new_encrypt(requiredSize);
 
       // 设置协议字段
       errorPacket.set_protocol(PROTOCOL.ERROR);
+      errorPacket.set_transport_protocol(ERROR_CODES[errorCode] || 6);
       errorPacket.set_destination(destination);
       errorPacket.set_source(gateway || this.serverPeerId || 0);
-      errorPacket.set_gateway_flag(true); // 添加网关标志
-      errorPacket.first_set_ttl(15); // 添加TTL设置
+      errorPacket.set_gateway_flag(true);
+      errorPacket.first_set_ttl(15);
       errorPacket.set_payload(errorPayload);
 
       logger.info(`[错误包-创建] 错误包创建完成，大小: ${requiredSize}字节`);
       return errorPacket;
     } catch (error) {
       logger.error(`[错误包-失败] 创建错误包失败: ${error.message}`, error);
-      // 返回一个基本的错误包
+      // 返回基本错误包
       const fallbackPacket = NetPacket.new_encrypt(12 + ENCRYPTION_RESERVED);
       fallbackPacket.set_protocol(PROTOCOL.ERROR);
       fallbackPacket.set_source(gateway);
@@ -1335,7 +1309,7 @@ export class PacketHandler {
   createHandshakeResponse(request, rsaData = null) {
     // logger.debug(`[握手响应-开始] 开始创建握手响应`);
     const clientVersion = request.version || "Unknown";
-    logger.info(`[握手响应-版本] 客户端版本: ${clientVersion}`);
+    logger.info(`[握手-版本] 客户端版本: ${clientVersion}`);
 
     const responseData = {
       version: clientVersion,
@@ -1347,7 +1321,7 @@ export class PacketHandler {
     // 添加调试日志
     if (rsaData) {
       logger.info(
-        `[握手响应-RSA] 设置RSA数据: secret=${rsaData.secret}, key_finger长度=${rsaData.key_finger.length}`
+        `[握手-RSA] 设置RSA数据: secret=${rsaData.secret}, key_finger长度=${rsaData.key_finger.length}`
       );
     }
 
@@ -1613,21 +1587,33 @@ export class PacketHandler {
       const defaultGatewayIp = this.env.GATEWAY || "10.26.0.1";
       let gateway = this.parseIpv4(defaultGatewayIp);
       let network = gateway; // 默认使用网关地址作为网络地址
-      let netmask = 0xffffff00; // 255.255.255.0
+      let netmask;
+      if (this.env.NETMASK) {
+        netmask = this.parseIpv4(this.env.NETMASK);
+        if (netmask === 0) {
+          logger.warn(
+            `无效的子网掩码配置: ${this.env.NETMASK}，使用默认值 255.255.255.0`
+          );
+          netmask = 0xffffff00; // 255.255.255.0
+        }
+      } else {
+        netmask = 0xffffff00; // 255.255.255.0
+      }
 
       // 如果第一个客户端指定了IP，根据其更新网段
       if (requestedIp !== 0) {
         network = requestedIp & netmask;
         gateway = network | 1;
         logger.info(
-          `[网络信息-网段] 客户端指定了IP，更新当前Token网关: ${this.formatIp(
+          `[网络信息-网段] 客户端指定了IP，更新当前Token网关为: ${this.formatIp(
             gateway
-          )}, 网络: ${this.formatIp(network)}`
+          )}, 子网掩码: ${this.formatIp(network)}`
         );
       }
 
       networkInfo = new NetworkInfo(network, netmask, gateway);
       this.cache.networks.set(token, networkInfo);
+      this.cache.virtual_network.set(token, networkInfo);
       // logger.debug(`[网络信息-存储] 网络信息已缓存，Token: ${token}`);
     } else {
       networkInfo = this.cache.networks.get(token);
@@ -1664,24 +1650,13 @@ export class PacketHandler {
     // logger.debug(`[IP分配-重用] 检查设备ID重用: ${deviceId}`);
     for (const [ip, client] of networkInfo.clients) {
       if (client.device_id === deviceId) {
-        // 修复：必须检查客户端是否在线
-        if (client.online) {
-          // 设备在线，不能重用，应该返回错误
-          logger.error(
-            `[IP分配-冲突] 设备ID ${deviceId} 已在线，IP: ${this.formatIp(ip)}`
-          );
-          throw new Error(`Device ID ${deviceId} is already online`);
-        } else {
-          // 设备离线，可以重用IP
-          virtualIp = ip;
-          insert = false;
-          logger.info(
-            `[IP分配-重用] 找到离线设备之前使用的IP: ${this.formatIp(
-              virtualIp
-            )}`
-          );
-          break;
-        }
+        // 设备重用IP
+        virtualIp = ip;
+        insert = false;
+        logger.info(
+          `[IP分配-重用] 找到设备之前使用的IP: ${this.formatIp(virtualIp)}`
+        );
+        break;
       }
     }
 
@@ -1715,8 +1690,8 @@ export class PacketHandler {
 
     // 3. 检查是否找到可用IP
     if (virtualIp === 0) {
-      logger.error(`[IP分配-失败] 地址池已用尽，无法分配IP`);
-      throw new Error("No available IP addresses");
+      // logger.error(`[IP分配-失败] 地址池已用尽，无法分配IP`);
+      return 0;
     }
 
     logger.debug(`[IP分配-完成] IP分配完成: ${this.formatIp(virtualIp)}`);
@@ -1745,15 +1720,30 @@ export class PacketHandler {
   /**
    * 检查IP冲突并处理
    */
-  checkIpConflict(networkInfo, virtualIp, deviceId, allowIpChange) {
-    if (virtualIp === 0) return { canUse: true, needReallocate: false };
+  checkIpConflict(
+    networkInfo,
+    virtualIp,
+    deviceId,
+    allowIpChange,
+    addr,
+    packet,
+    gateway
+  ) {
+    if (virtualIp === 0)
+      return { canUse: true, needReallocate: false, errorPacket: null };
 
     // 检查是否为网关地址
     if (virtualIp === networkInfo.gateway) {
       logger.warn(
         `[IP冲突-网关] 请求的IP为网关地址: ${this.formatIp(virtualIp)}`
       );
-      throw new Error("Cannot use gateway address");
+      const errorPacket = this.createErrorPacket(
+        addr,
+        packet.source,
+        "INVALID_IP",
+        gateway
+      );
+      return { canUse: false, needReallocate: false, errorPacket };
     }
 
     // 检查IP是否已被占用
@@ -1767,25 +1757,31 @@ export class PacketHandler {
               existingClient.device_id
             }`
           );
-          throw new Error("IP already exists");
+          const errorPacket = this.createErrorPacket(
+            addr,
+            packet.source,
+            "IP_ALREADY_EXISTS",
+            gateway
+          );
+          return { canUse: false, needReallocate: false, errorPacket };
         } else {
           logger.info(
             `[IP冲突-重新分配] IP被占用，允许重新分配: ${this.formatIp(
               virtualIp
             )}`
           );
-          return { canUse: false, needReallocate: true };
+          return { canUse: false, needReallocate: true, errorPacket: null };
         }
       } else {
         // 同一设备重用IP
         logger.debug(
           `[IP冲突-重用] 同一设备重用IP: ${this.formatIp(virtualIp)}`
         );
-        return { canUse: true, needReallocate: false };
+        return { canUse: true, needReallocate: false, errorPacket: null };
       }
     }
 
-    return { canUse: true, needReallocate: false };
+    return { canUse: true, needReallocate: false, errorPacket: null };
   }
   validatePacket(packet) {
     // logger.debug(`[数据包验证-开始] 开始验证VNT数据包`);
